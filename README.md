@@ -76,18 +76,22 @@ Production-style: `npm run build && npm start` serves the built UI and the socke
 | `test/board.test.ts` | apply rules (CAS rename, delete wins, validation, cap), ordering, zod schema rejects hostile messages | 11 |
 | `test/sync-state.test.ts` | optimistic view, rebase over remote ops, reject → notice, gap → resync, catch-up + resend | 9 |
 | `test/room.test.ts` | server ordering, dedupe, reject to sender only, rank collision, catch-up vs snapshot, rate limit, presence coalescing, restart from the same SQLite file | 10 |
+| `test/sync-client.test.ts` | socket layer with a fake socket that never fires `close` (how Node 22's WebSocket behaves when closed mid-connect): drop while connecting, connect timeout, late frames ignored, `stop()` | 4 |
 | `test/integration.test.ts` | real server + real sockets + `SyncClient`: presence, offline ops sent once, lost ack, server reset, and a **chaos property**: 3 clients, 120 random ops with random disconnects, 8 seeds, all three views must equal the server's board | 5 |
 | `e2e/board.spec.ts` | Playwright, two browser contexts as two people, desktop Chrome + Pixel 7: sync, Alt+Arrow move, reorder, presence, concurrent rename conflict, simulated drop, drag and drop, axe WCAG 2.1 AA in light and dark, no sideways page scroll on phones | 19 (+1 skipped: drag on phone) |
 
-`npm test` runs the first 42; `npm run test:e2e` builds the UI and runs Playwright against the
+`npm test` runs the first 46; `npm run test:e2e` builds the UI and runs Playwright against the
 production server with an in-memory database.
 
-**Mutation check:** 13 deliberate bugs (e.g. remove the dedupe, drop the rename CAS, don't
+**Mutation check:** 14 deliberate bugs (e.g. remove the dedupe, drop the rename CAS, don't
 clear pending on commit, skip the resend after reconnect, don't resolve rank collisions,
 don't refocus after a keyboard move) were each caught by at least one test, then reverted.
-Two real bugs were found while writing the tests: ranks appended at the end of a column
-grew about 5x faster than intended (fixed with single-digit steps), and visually hidden
-labels widened the page on phones.
+Three real bugs were found by the tests: ranks appended at the end of a column grew about
+5x faster than intended (fixed with single-digit steps); visually hidden labels widened
+the page on phones; and in CI the chaos test hung on Node 22.18 only, because Node 22's
+WebSocket never fires `close` for a socket closed while still connecting. The client now
+treats a socket it closes as lost immediately and gives up on connections that aren't
+welcomed within 10 s.
 
 ## Honest limits
 

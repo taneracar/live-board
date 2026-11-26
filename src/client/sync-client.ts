@@ -22,6 +22,8 @@ export interface SyncClientOptions {
   WebSocketImpl?: typeof WebSocket;
   pingMs?: number;
   pongTimeoutMs?: number;
+  /** Give up on a connection that has not been welcomed within this time. */
+  connectTimeoutMs?: number;
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   random?: () => number;
@@ -42,6 +44,7 @@ export class SyncClient {
   private timers = new Set<ReturnType<typeof setTimeout>>();
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongDeadline: ReturnType<typeof setTimeout> | null = null;
+  private connectDeadline: ReturnType<typeof setTimeout> | null = null;
   private presence = { editing: null as string | null, dragging: null as string | null };
   private readonly o: Required<SyncClientOptions>;
 
@@ -50,6 +53,7 @@ export class SyncClient {
       WebSocketImpl: globalThis.WebSocket,
       pingMs: 10_000,
       pongTimeoutMs: 5_000,
+      connectTimeoutMs: 10_000,
       backoffBaseMs: 250,
       backoffMaxMs: 10_000,
       random: Math.random,
@@ -84,15 +88,51 @@ export class SyncClient {
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
     this.stopPing();
-    this.ws?.close(1000, "bye");
+    this.clearConnectDeadline();
+    const ws = this.ws;
     this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close(1000, "bye");
+    }
     this.setStatus("offline");
   }
 
   /** Drop the current socket as if the network blipped (tests, and the UI's
    * "simulate disconnect" button). The client reconnects on its own. */
   dropConnection(): void {
-    this.ws?.close(4001, "simulated drop");
+    this.drop(4001, "simulated drop");
+  }
+
+  /** Close the current socket and treat it as lost right away. We don't wait
+   * for its close event: Node 22's WebSocket never fires one for a socket
+   * closed while still connecting, which left the client stuck (found by the
+   * chaos test in CI). Handlers are detached so late frames are ignored. */
+  private drop(code: number, reason: string) {
+    const ws = this.ws;
+    if (!ws) return;
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* already closing */
+    }
+    this.lost(ws);
+  }
+
+  private lost(ws: WebSocket) {
+    if (this.ws !== ws) return;
+    this.ws = null;
+    this.stopPing();
+    this.clearConnectDeadline();
+    if (this.stopped) return;
+    this.setStatus("offline");
+    this.scheduleReconnect();
+  }
+
+  private clearConnectDeadline() {
+    if (this.connectDeadline) clearTimeout(this.connectDeadline);
+    this.connectDeadline = null;
   }
 
   /** Apply locally now, send to the server, and keep it pending until the
@@ -126,6 +166,11 @@ export class SyncClient {
     this.setStatus("connecting");
     const ws = new this.o.WebSocketImpl(this.o.url);
     this.ws = ws;
+    this.clearConnectDeadline();
+    this.connectDeadline = setTimeout(() => {
+      this.connectDeadline = null;
+      if (this.ws === ws) this.drop(4004, "connect timeout");
+    }, this.o.connectTimeoutMs);
 
     ws.onopen = () => {
       this.send({
@@ -145,14 +190,7 @@ export class SyncClient {
       }
       this.onMessage(msg);
     };
-    ws.onclose = () => {
-      if (this.ws !== ws) return;
-      this.ws = null;
-      this.stopPing();
-      if (this.stopped) return;
-      this.setStatus("offline");
-      this.scheduleReconnect();
-    };
+    ws.onclose = () => this.lost(ws);
     ws.onerror = () => {
       /* onclose follows and handles it */
     };
@@ -167,6 +205,7 @@ export class SyncClient {
     if (msg.t === "welcome") {
       this.sessions++;
       this.attempt = 0;
+      this.clearConnectDeadline();
       this.setStatus("online", false);
     }
     const { state, effect } = receive(this.state, msg);
@@ -176,7 +215,7 @@ export class SyncClient {
     } else if (effect.kind === "resync") {
       // Missed something: forget confirmed state and ask for a snapshot.
       this.state = { ...this.state, ready: false };
-      this.ws?.close(4002, "resync");
+      this.drop(4002, "resync");
     }
     this.emit();
   }
@@ -209,7 +248,7 @@ export class SyncClient {
       if (this.pongDeadline) return;
       this.pongDeadline = setTimeout(() => {
         this.pongDeadline = null;
-        this.ws?.close(4003, "no pong");
+        this.drop(4003, "no pong");
       }, this.o.pongTimeoutMs);
     }, this.o.pingMs);
   }
